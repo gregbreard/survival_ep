@@ -27,3 +27,15 @@ BEGIN_RCPP
     return __result;
 END_RCPP
 }
+// vectorAdd2
+List vectorAdd2(NumericVector a, NumericVector b);
+RcppExport SEXP survivalEP_vectorAdd2(SEXP aSEXP, SEXP bSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject __result;
+    Rcpp::RNGScope __rngScope;
+    Rcpp::traits::input_parameter< NumericVector >::type a(aSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type b(bSEXP);
+    __result = Rcpp::wrap(vectorAdd2(a, b));
+    return __result;
+END_RCPP
+}

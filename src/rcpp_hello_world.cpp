@@ -34,7 +34,7 @@ static void print_device_info(cl_device_id device){
 
 // A utility function that checks that our kernel execution performs the
 // requested work over the entire range of data.
-static int validate(cl_float* input1, cl_float* input2, cl_float* output) {
+static int validate(int* input1, int* input2, int* output) {
     int i;
     for (i = 0; i < NUM_VALUES; i++) {
         
@@ -43,7 +43,7 @@ static int validate(cl_float* input1, cl_float* input2, cl_float* output) {
             fprintf(stdout,
                     "Error: Element %d did not match expected output.\n", i);
             fprintf(stdout,
-                    "       Saw %1.4f, expected %1.4f\n", output[i], input1[i] + input2[i]);
+                    "       Saw %d, expected %d\n", output[i], input1[i] + input2[i]);
             fflush(stdout);
             return 0;
         } // end if
@@ -65,155 +65,195 @@ List rcpp_hello_world() {
 
 // [[Rcpp::export]]
 List vectorAdd(NumericVector a, NumericVector b) {
-    char name[128];
+  char name[128];
+  cl_int err;
+  cl_platform_id platform;
+  cl_uint deviceCount;
+  cl_device_id device;
+  cl_context context;
+  cl_program program;
+  cl_kernel kernel;
+  cl_command_queue queue;
+  
+  // Get the platform
+  clGetPlatformIDs(1, &platform, NULL);
+  
+  // Get the device count
+  clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &deviceCount);
+  
+  // Get all of the devices
+  cl_device_id devices[deviceCount];
+  clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, deviceCount, devices, NULL);
+  
+  // Choose the device with the most compute units
+  int max_cus = 0;
+  for (int i = 0; i < deviceCount; i++) {
+    int this_cus = 0;
+    clGetDeviceInfo(devices[i], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(int), &this_cus, NULL);
+    clGetDeviceInfo(devices[i], CL_DEVICE_NAME, 128, name, NULL);
+    fprintf(stdout, "Device %d: %s (%d CUs)\n", i, name, this_cus);
     
-    // Get the platform
-    cl_platform_id platform;
-    clGetPlatformIDs(1, &platform, NULL);
-    
-    // Get the device count
-    cl_uint deviceCount;
-    clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &deviceCount);
-    
-    // Get all of the devices
-    cl_device_id devices[deviceCount];
-    clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, deviceCount, devices, NULL);
-    
-    // Print the info for all the devices
-    for (int i = 0; i < deviceCount; i++) {
-        // Output the info
-        print_device_info(devices[i]);
-    } // end for
-    
-    // Try to obtain a dispatch queue for the GPU
-    dispatch_queue_t queue = gcl_create_dispatch_queue(CL_DEVICE_TYPE_GPU, NULL);
-    
-    // If no GPU available, use the CPU
-    if (queue == NULL) {
-        queue = gcl_create_dispatch_queue(CL_DEVICE_TYPE_CPU, NULL);
+    if (this_cus > max_cus){
+      device = devices[i];
+      max_cus = this_cus;
     } // end if
+  } // end for
+  
+  // Print out the device name
+  clGetDeviceInfo(device, CL_DEVICE_NAME, 128, name, NULL);
+  fprintf(stdout, "Using: %s\n", name);
+  
+  // Create the context for the device
+  context = clCreateContext(0, 1, &device, NULL, NULL, &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
+  
+  // Read in the kernel source
+  std::ifstream source("ep_kernel.cl");
+  std::string sourceCode(std::istreambuf_iterator<char>(source), (std::istreambuf_iterator<char>()));
+  fprintf(stdout, "Kernel Source:\n %s\n", sourceCode.c_str());
+  
+  // Just to do something in R  
+  List c = List::create(a, b);
+  return c;
+}
+
+// [[Rcpp::export]]
+List vectorAdd2(NumericVector a, NumericVector b) {
+  char name[128];
+  cl_int err;
+  cl_platform_id platform;
+  cl_uint deviceCount;
+  cl_device_id device;
+  cl_context context;
+  cl_program program;
+  cl_kernel kernel;
+  cl_command_queue queue;
+  
+  // Get the platform
+  clGetPlatformIDs(1, &platform, NULL);
+
+  // Get the device count
+  clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, 0, NULL, &deviceCount);
     
-    // This is not required, but let's print out the name of the device we're using.
-    cl_device_id gpu = gcl_get_device_id_with_dispatch_queue(queue);
-    clGetDeviceInfo(gpu, CL_DEVICE_NAME, 128, name, NULL);
-    fprintf(stdout, "Created a dispatch queue using the %s\n", name);
+  // Get all of the devices
+  cl_device_id devices[deviceCount];
+  clGetDeviceIDs(platform, CL_DEVICE_TYPE_ALL, deviceCount, devices, NULL);
     
-    // Here we hardcode some test data.
-    // Normally, when this application is running for real, data would come from
-    // some REAL source, such as a camera, a sensor, or some compiled collection
-    // of statistics—it just depends on the problem you want to solve.
-    float* test_in1 = (float*)malloc(sizeof(cl_float) * NUM_VALUES);
-    float* test_in2 = (float*)malloc(sizeof(cl_float) * NUM_VALUES);
-    for (int i = 0; i < NUM_VALUES; i++) {
-        test_in1[i] = (cl_float)i;
-        test_in2[i] = (cl_float)(NUM_VALUES - i);
-    } // end for
-    
-    // Once the computation using CL is done, will have to read the results
-    // back into our application's memory space.  Allocate some space for that.
-    float* test_out = (float*)malloc(sizeof(cl_float) * NUM_VALUES);
-    
-    // The test kernel takes two parameters: an input float array and an
-    // output float array.  We can't send the application's buffers above, since
-    // our CL device operates on its own memory space.  Therefore, we allocate
-    // OpenCL memory for doing the work.  Notice that for the input array,
-    // we specify CL_MEM_COPY_HOST_PTR and provide the fake input data we
-    // created above.  This tells OpenCL to copy the data into its memory
-    // space before it executes the kernel.                               // 3
-    void* mem_in1  = gcl_malloc(sizeof(cl_float) * NUM_VALUES, test_in1, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR);
-    void* mem_in2  = gcl_malloc(sizeof(cl_float) * NUM_VALUES, test_in2, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR);
-    
-    // The output array is not initalized; we're going to fill it up when
-    // we execute our kernel.                                             // 4
-    void* mem_out = gcl_malloc(sizeof(cl_float) * NUM_VALUES, NULL, CL_MEM_WRITE_ONLY);
-    
-    // Create the kernel
-    
-    // Read the program source
-    std::ifstream sourceFile("ep_kernel.cl");
-    std::string sourceCode( std::istreambuf_iterator<char>(sourceFile), (std::istreambuf_iterator<char>()));
-    Program::Sources source(1, std::make_pair(sourceCode.c_str(), sourceCode.length()));
-    
-    // Make program from the source code
-    Program program=opencl::Program(context, source);
-    
-    // Build the program for the devices
-    program.build(devices);
-    
-    // Make kernel
-    opencl::Kernel vectorAdd_kernel(program, "vectorAdd");
-    
-    
-    // Dispatch the kernel block using one of the dispatch_ commands and the
-    // queue created earlier.                                            // 5
-    
-    dispatch_sync(queue, ^{
-        // Although we could pass NULL as the workgroup size, which would tell
-        // OpenCL to pick the one it thinks is best, we can also ask
-        // OpenCL for the suggested size, and pass it ourselves.
-        size_t wgs;
-        gcl_get_kernel_block_workgroup_info(vectorAdd_kernel, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgs), &wgs, NULL);
-        
-        // The N-Dimensional Range over which we'd like to execute our
-        // kernel.  In this case, we're operating on a 1D buffer, so
-        // it makes sense that the range is 1D.
-        cl_ndrange range = {                                              // 6
-            1,                     // The number of dimensions to use.
-            
-            {0, 0, 0},             // The offset in each dimension.  To specify
-            // that all the data is processed, this is 0
-            // in the test case.                   // 7
-            
-            {NUM_VALUES, 0, 0},    // The global range—this is how many items
-            // IN TOTAL in each dimension you want to
-            // process.
-            
-            {wgs, 0, 0}            // The local size of each workgroup.  This
-            // determines the number of work items per
-            // workgroup.  It indirectly affects the
-            // number of workgroups, since the global
-            // size / local size yields the number of
-            // workgroups.  In this test case, there are
-            // NUM_VALUE / wgs workgroups.
-        };
-        
-        // Calling the kernel is easy; simply call it like a function,
-        // passing the ndrange as the first parameter, followed by the expected
-        // kernel parameters.  Note that we case the 'void*' here to the
-        // expected OpenCL types.  Remember, a 'float' in the
-        // kernel, is a 'cl_float' from the application's perspective.   // 8
-        
-        vectorAdd_kernel(&range, (cl_float*)mem_in1, (cl_float*)mem_in2, (cl_float*)mem_out);
-        
-        // Getting data out of the device's memory space is also easy;
-        // use gcl_memcpy.  In this case, gcl_memcpy takes the output
-        // computed by the kernel and copies it over to the
-        // application's memory space.                                   // 9
-        
-        gcl_memcpy(test_out, mem_out, sizeof(cl_float) * NUM_VALUES);
-        
-    });
-    
-    // Check to see if the kernel did what it was supposed to:
-    if (validate(test_in1, test_in2, test_out)) {
-        fprintf(stdout, "All values were properly added.\n");
+  // Choose the device with the most compute units
+  int max_cus = 0;
+  for (int i = 0; i < deviceCount; i++) {
+  int this_cus = 0;
+    clGetDeviceInfo(devices[i], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(int), &this_cus, NULL);
+    if (this_cus > max_cus){
+      device = devices[i];
+      max_cus = this_cus;
     } // end if
+  } // end for
     
-    // Clean up
+  // Print out the device name
+  //clGetDeviceInfo(device, CL_DEVICE_NAME, 128, name, NULL);
+  //fprintf(stdout, "Using: %d\n", device);
+  //fprintf(stdout, "test %d\n", 1);
+  
+  // Create the context for the device
+  context = clCreateContext(0, 1, &device, NULL, NULL, &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
     
-    // Don't forget to free up the CL device's memory when you're done. // 10
-    gcl_free(mem_in1);
-    gcl_free(mem_in2);
-    gcl_free(mem_out);
+  // Read in the kernel source
+  std::ifstream sourceFile("ep_kernel.cl");
+  std::string sourceCode( std::istreambuf_iterator<char>(sourceFile), (std::istreambuf_iterator<char>()));
+   
+  // Create the program from the source code 
+  // (we need to wrap the string in an array list for the function)
+  const char **cptr;
+  cptr = (const char **) malloc(sizeof(char*));
+  cptr[1] = sourceCode.c_str();
+  program = clCreateProgramWithSource(context, 1, cptr, NULL, &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
+  
+  // Build the program
+  clBuildProgram(program, 0, NULL, NULL, NULL, NULL);
+  
+  // Create the kernel
+  kernel = clCreateKernel(program, "vectorAdd", &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
+  
+  // Create the command queue to execute
+  queue = clCreateCommandQueue(context, device, 0, &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
+  
+  // test
+  
+  // Create the test data
+  int* test_in1 = (int*)malloc(sizeof(int) * NUM_VALUES);
+  int* test_in2 = (int*)malloc(sizeof(int) * NUM_VALUES);
+  int* test_out = (int*)malloc(sizeof(int) * NUM_VALUES);
+  for (int i = 0; i < NUM_VALUES; i++) {
+    test_in1[i] = (int)i;
+    test_in2[i] = (int)(NUM_VALUES - i);
+  } // end for
+  
+  // /test
+  
+  // Set the input memory
+  cl_mem mem_in1 = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * NUM_VALUES,  test_in1, &err);
+  cl_mem mem_in2 = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * NUM_VALUES,  test_in2, &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
+  
+  // Set the output memory
+  cl_mem mem_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(int) * NUM_VALUES, NULL, &err);
+  if (err != CL_SUCCESS) {
+    stop("error");
+  } // end if
+  
+  // Set the parameters
+  clSetKernelArg(kernel, 0, sizeof(cl_mem), &mem_in1);
+  clSetKernelArg(kernel, 1, sizeof(cl_mem), &mem_in2);
+  
+  // Set the kernel for execution
+  int dim = 1;
+  size_t dims[3] = {NUM_VALUES, 0, 0};
+  clEnqueueNDRangeKernel(queue, kernel, dim, NULL, dims, NULL, 0, NULL, NULL);
+  
+  // Execute
+  clFlush(queue);
+  clFinish(queue);
     
-    // And the same goes for system memory, as usual.
-    free(test_in1);
-    free(test_in2);
-    free(test_out);
+  // Read out our results
+  clEnqueueReadBuffer(queue, mem_out, CL_TRUE, 0, sizeof(int) * NUM_VALUES, test_out, 0, NULL, NULL);
+  
+  // Check to see if the kernel did what it was supposed to:
+  if (validate(test_in1, test_in2, test_out)) {
+    fprintf(stdout, "All values were properly added.\n");
+  } // end if
     
-    // Finally, release your queue just as you would any GCD queue.    // 11
-    dispatch_release(queue);
-    
-    List c = List::create(a, b);
-    return c;
+  // Clean up OpenCL resources
+  clReleaseMemObject(mem_in1);
+  clReleaseMemObject(mem_in2);
+  clReleaseMemObject(mem_out);
+  clReleaseKernel(kernel);
+  clReleaseProgram(program);
+  clReleaseCommandQueue(queue);
+  clReleaseContext(context);
+  
+  // And sytem resources
+  free(test_in1);
+  free(test_in2);
+  free(test_out);
+  
+  // Just to do something in R  
+  List c = List::create(a, b);
+  return c;
 }
