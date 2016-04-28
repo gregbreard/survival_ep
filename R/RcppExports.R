@@ -9,7 +9,3 @@ vectorAdd <- function(a, b) {
     .Call('survivalEP_vectorAdd', PACKAGE = 'survivalEP', a, b)
 }
 
-vectorAdd2 <- function(a, b) {
-    .Call('survivalEP_vectorAdd2', PACKAGE = 'survivalEP', a, b)
-}
-
