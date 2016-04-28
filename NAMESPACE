@@ -1,0 +1,3 @@
+useDynLib(survivalEP)
+exportPattern("^[[:alpha:]]+")
+importFrom(Rcpp, evalCpp)
