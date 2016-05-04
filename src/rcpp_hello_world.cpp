@@ -17,8 +17,8 @@
 using namespace Rcpp;
 
 // Store the kernel source code in an array of lines
-const int SOURCE_LINES = 4;
-const char* source[SOURCE_LINES] = {
+const int VEC_SOURCE_LINES = 4;
+const char* vec_source[VEC_SOURCE_LINES] = {
   "kernel void vectorAdd(global float* input1, global float* input2, global float* output) {",
   "  size_t i = get_global_id(0);",
   "  output[i] = input1[i] + input2[i];",
@@ -52,23 +52,11 @@ static int validate(float* input1, float* input2, float* output, int vecLen) {
   } // end for
   
   if (bad) 
-    return 0;
-  else
-    return 1;
+    stop("did not validate");
+
+  return 0;
 } // end validate
 
-
-// [[Rcpp::export]]
-List rcpp_hello_world() {
-
-    CharacterVector x = CharacterVector::create( "foo", "bar" )  ;
-    NumericVector y   = NumericVector::create( 0.0, 1.0 ) ;
-    List z            = List::create( x, y ) ;
-
-    return z ;
-}
-
-// [[Rcpp::export]]
 NumericVector vectorAdd(NumericVector a, NumericVector b) {
   char name[128];
   int vecLen = 1024;
@@ -123,7 +111,7 @@ NumericVector vectorAdd(NumericVector a, NumericVector b) {
   } // end if
   
   // Create the program from the source code 
-  program = clCreateProgramWithSource(context, SOURCE_LINES, source, NULL, NULL);
+  program = clCreateProgramWithSource(context, VEC_SOURCE_LINES, vec_source, NULL, NULL);
   if (err != CL_SUCCESS) {
     stop("program could not be created from program source");
   } // end if
@@ -210,7 +198,7 @@ NumericVector vectorAdd(NumericVector a, NumericVector b) {
   // Convert array to R vector
   NumericVector c(vecLen);
   for (int i = 0; i < vecLen; i++)
-    c[i] = (double)test_out[i];
+    c[i] = test_out[i];
   
   return c;
 } // end vectorAdd
