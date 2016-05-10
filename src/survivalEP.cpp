@@ -18,32 +18,63 @@
 
 using namespace Rcpp;
 
-//"float dnorm(float x) {\n",
-//"  //float val = x;//val = (1 / sqrt(2 * M_PI)) * exp(-1 * pow(x, 2) / 2);\n",
-//"  return x;\n"
-//"}\n",
+const bool DEBUG = false;
 
 // Store the kernel source code in an array of lines
-const int SOURCE_LINES = 19;
+const int SOURCE_LINES = 53;
 const char* source[SOURCE_LINES] = {
-  "// work around for missing M_PI\n",
-  "constant float PI = 3.14159265358979323846;\n",
+  "#define M_SQRT1_2PI_F 0.3989422804\n",
+  "// probability functions\n",
   "float dnorm(float x) {\n",
-  "  return (1 / sqrt(2 * PI)) * exp(-1 * (x * x) / 2);\n",
+  "  return M_SQRT1_2PI_F * exp(-1 * (x * x) / 2);\n",
   "}\n",
-  "float pnorm(float x, int n) {\n",
-  "  float sum = 0;\n",
-  "  float delta = (x + 5) / n;\n",
-  "  float i = -5;\n",
-  "  while (i <= x) {\n",
-  "    sum += dnorm(i);\n",
-  "    i += delta;\n",
+  "float pnorm(float x) {\n",
+  "  return ((1 + erf(x / M_SQRT2_F)) / 2);\n",
+  "}\n",
+  "float f(float mu) {\n",
+  "  return (dnorm(-mu) / (1 - pnorm(-mu)));\n",
+  "}\n",
+  "float g(float mu) {\n",
+  "  return (dnorm(-mu) / pnorm(-mu));\n",
+  "}\n",
+  "// kernel for performing the expectation maximization \n",
+  "kernel void batchEM(global float* x, global float* y, global float* z,\n",
+  "                    global float* b_temp, global float* beta_part, global float* beta, global float* eystar,\n",
+  "                    const int x_cols, const int x_rows, const int max_iter) {\n",
+  "  // initialize our variables \n;",
+  "  const size_t row = get_global_id(0);\n",
+  "  const size_t loc = get_local_id(0);\n",
+  "  const size_t grp = get_group_id(0);\n",
+  "  const size_t grps = get_num_groups(0);\n",
+  "  // run our iterations \n",
+  "  for (int k = 0; k < max_iter; k++) {\n",
+  "    float mu = 0.0;\n",
+  "    // update mu \n",
+  "    for (int l = 0; l < x_cols; l++)\n",
+  "      mu += x[(row * x_cols) + l] * beta[l];\n",
+  "    // update our y star estimate \n",
+  "    if (y[row] == 1.0)\n",
+  "      eystar[row] =  loc; // mu + f(mu);\n",
+  "    else if (y[row] == 0.0)\n",
+  "      eystar[row] = loc; // mu - g(mu);\n",
+  "    // update our partial betas\n",
+  "    for (int m = 0; m < x_cols; m++)\n",
+  "      b_temp[(m * x_rows) + row] = z[(m * x_rows) + row] * eystar[row];\n",
+  "    // wait for all the threads\n",
+  "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
+  "    if (loc < x_cols) { //if (row < x_cols) {\n",
+  "      float beta_t = 0.0;\n",
+  "      int len = x_rows / grps;\n",
+  "      int start = grp * len;\n",
+  "      int end = start + len;\n",
+  "      for (int n = start; n < end; n++)\n",
+  "        beta_t += b_temp[(loc * x_rows) + n];\n", // "        beta_t += z_temp[(row * x_rows) + n];\n",
+  "      beta_part[(loc * x_rows) + grp] = beta_t; // beta[col] + beta_t;\n",
+  "    }\n",
+  "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
   "  }\n",
-  "  return sum * delta;\n",
-  "}\n",
-  "kernel void batchEM(global float* y, global float* x, global float* beta) {\n",
-  "  size_t i = get_global_id(0);\n",
-  "  beta[i] = pnorm(y[i], 1000);\n",
+  "  //for (int b = 0; b < x_cols; b++)\n",
+  "    //beta[b] = 0;//my_beta[b];\n",
   "}\n"
 };
 
@@ -76,9 +107,11 @@ void load_kernel() {
     int max_cus = 0;
     for (int i = 0; i < deviceCount; i++) {
       int this_cus = 0;
+      long mem = 0;
       clGetDeviceInfo(devices[i], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(int), &this_cus, NULL);
       clGetDeviceInfo(devices[i], CL_DEVICE_NAME, 128, name, NULL);
-      Rcout << "Device " << i << ": " << name << " (" << this_cus << " CUs)" << std::endl;
+      clGetDeviceInfo(devices[i], CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(long), &mem, NULL);
+      if (DEBUG) Rcout << "Device " << i << ": " << name << " (" << this_cus << " CUs) w " << mem << std::endl;
       
       if (this_cus > max_cus){
         device = devices[i];
@@ -88,7 +121,7 @@ void load_kernel() {
     
     // Print out the device name
     clGetDeviceInfo(device, CL_DEVICE_NAME, 128, name, NULL);
-    Rcout << "Using: " << name << std::endl;
+    if (DEBUG) Rcout << "Using: " << name << std::endl;
     
     // Create the context for the device
     context = clCreateContext(0, 1, &device, NULL, NULL, &err);
@@ -115,7 +148,6 @@ void load_kernel() {
       fprintf(stdout, "code: %d\n", err);
       stop("kernel could not be created");
     }
-      
     
     // Don't need to reload
     kernel_loaded = true;
@@ -132,117 +164,173 @@ void release_kernel() {
   kernel_loaded = false;
 } // end release_kernel
 
-double f (double mu) {
-  double val = ((R::dnorm(-mu, 0, 1, false)) /
-                  (1 - R::pnorm(-mu, 0, 1, true, false))
-  ) ;
-  return(val) ;
-}
+double f(double mu) {
+  return ((R::dnorm(-mu, 0, 1, false)) / (1 - R::pnorm(-mu, 0, 1, true, false)));
+} // end f
 
-double g (double mu) {
-  double val = ((R::dnorm(-mu, 0, 1, false)) /
-                  (R::pnorm(-mu, 0, 1, true, false))
-  ) ;
-  return(val) ;
-}
+double g(double mu) {
+  return ((R::dnorm(-mu, 0, 1, false)) / (R::pnorm(-mu, 0, 1, true, false)));
+} // end g
 
-void em_sequential(const arma::mat y, const arma::mat x, const arma::mat mu,
+void em_sequential(const arma::mat x, const arma::mat y, const arma::mat z, const int max_iter, 
                    arma::mat* beta, arma::mat* eystar) {
-  for (int i = 0; i < x.n_rows; i++) {
-    if (y(i, 0) == 1)
-      (*eystar)(i, 0) = mu(i, 0) + f(mu(i, 0));
-    if (y(i, 0) == 0)
-      (*eystar)(i, 0) = mu(i, 0) - g(mu(i, 0));
+  // Iterations
+  for (int i = 0; i < max_iter; i++) {
+    arma::mat mu = x * (*beta);
+    
+    for (int i = 0; i < y.n_rows; i++) {
+      if (y(i, 0) == 1)
+        (*eystar)(i, 0) = mu(i, 0) + f(mu(i, 0));
+      if (y(i, 0) == 0)
+        (*eystar)(i, 0) = mu(i, 0) - g(mu(i, 0));
+    } // end for
+   
+    // maximization step
+    (*beta) = z * (*eystar);
   } // end for
 } // end em_sequential
 
-void em_parallel(const arma::mat y, const arma::mat x, const arma::mat mu,
-                 arma::mat* beta, arma::mat* eystar) {
-  int y_rows = y.n_rows;
-  int y_cols = y.n_cols;
-  int x_rows = x.n_rows;
-  int x_cols = x.n_cols;
+void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter, 
+                      arma::mat* beta, arma::mat* eystar) {
+  // Get the dimensions
+  const int x_cols = (*x).n_cols;
+  const int x_rows = (*x).n_rows;
   
   // Create float arrays for the data
-  float *y_fl = new float[y_rows * y_cols];
   float *x_fl = new float[x_rows * x_cols];
+  float *y_fl = new float[x_rows];
+  float *z_fl = new float[x_cols * x_rows];
+  float *beta_temp_fl = new float[x_cols * x_rows];
+  float *beta_part_fl = new float[x_cols * x_rows];
   float *beta_fl = new float[x_cols];
   float *eystar_fl = new float[x_rows];
   
   // Copy the data to arrays
-  for (int i = 0; i < y_rows; i++)
-    for (int j = 0; j < y_cols; j++)
-      y_fl[(i * y_rows) + j] = (float)y(i,j);
-  for (int i = 0; i < x_rows; i++)
-    for (int j = 0; j < x_cols; j++)
-      x_fl[(i * x_rows) + j] = (float)x(i,j);
-  for (int i = 0; i < x_cols; i++)
-    beta_fl[i] = (*beta)(i, 0);
-  for (int i = 0; i < x_rows; i++)
-    eystar_fl[i] = (*eystar)(i, 0);
+  for (int i = 0; i < x_rows; i++){
+    y_fl[i] = (float)y(i, 0);
+    
+    for (int j = 0; j < x_cols; j++) {
+      x_fl[(i * x_cols) + j] = (float)(*x)(i, j);
+      z_fl[(j * x_rows) + i] = (float)z(j, i);
+      beta_temp_fl[(j * x_rows) + i] = 0.0;
+      beta_part_fl[(j * x_rows) + i] = 0.0;
+      
+      if (i == 0)
+        beta_fl[j] = 0.0;
+    } // end for (j)
+  } // end for (i)
+  if (DEBUG) warning("got here 0");
   
+  // Load the OpenCL device stuff
+  load_kernel();
+
   // Create the command queue to execute
   queue = clCreateCommandQueue(context, device, 0, &err);
   if (err != CL_SUCCESS)
     stop("command queue could not be created");
+  if (DEBUG) warning("got here 2");
     
   // Set the input memory
-  cl_mem mem_y_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * y_rows * y_cols,  y_fl, &err);
-  cl_mem mem_x_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_rows * x_cols,  x_fl, &err);
+  cl_mem x_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_rows * x_cols),  x_fl, &err);
+  cl_mem y_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_rows,  y_fl, &err);
+  cl_mem z_in = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows),  z_fl, &err);
   if (err != CL_SUCCESS)
     stop("failed to allocate input buffer");
+  if (DEBUG) warning("got here 3");
   
-  // Set the output memory
-  cl_mem mem_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * x.n_rows, NULL, &err);
+  // Set the input/output memory
+  cl_mem beta_temp_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows), beta_temp_fl, &err);
+  cl_mem beta_part_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows), beta_part_fl, &err);
+  cl_mem beta_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_cols, beta_fl, &err);
+  cl_mem eystar_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_rows, eystar_fl, &err);
   if (err != CL_SUCCESS)
-    stop("failed to allocate output buffer");
+    stop("failed to allocate i/o buffer");
+  if (DEBUG) warning("got here 3.5");
+    
+  // Set scalar memory
+  const cl_int max_iter_in = max_iter;
+  const cl_int x_cols_in = x_cols;
+  const cl_int x_rows_in = x_rows;
   
   // Set the parameters
-  clSetKernelArg(kernel, 0, sizeof(cl_mem), &mem_y_in);
-  clSetKernelArg(kernel, 1, sizeof(cl_mem), &mem_x_in);
-  clSetKernelArg(kernel, 2, sizeof(cl_mem), &mem_out);
+  clSetKernelArg(kernel, 0, sizeof(cl_mem), &x_in);
+  clSetKernelArg(kernel, 1, sizeof(cl_mem), &y_in);
+  clSetKernelArg(kernel, 2, sizeof(cl_mem), &z_in);
+  clSetKernelArg(kernel, 3, sizeof(cl_mem), &beta_temp_io);
+  clSetKernelArg(kernel, 4, sizeof(cl_mem), &beta_part_io);
+  clSetKernelArg(kernel, 5, sizeof(cl_mem), &beta_io);
+  clSetKernelArg(kernel, 6, sizeof(cl_mem), &eystar_io);
+  clSetKernelArg(kernel, 7, sizeof(cl_int), &x_cols_in);
+  clSetKernelArg(kernel, 8, sizeof(cl_int), &x_rows_in);
+  clSetKernelArg(kernel, 9, sizeof(cl_int), &max_iter_in);
+  
+  if (DEBUG) warning("got here 5");
   
   // Set the kernel for execution
-  int dim = 1;
-  size_t dims[3] = {x.n_rows, 0, 0};
-  clEnqueueNDRangeKernel(queue, kernel, dim, NULL, dims, NULL, 0, NULL, NULL);
+  const int dim = 1;
+  const size_t g_dims[] = {x_rows};
+  clEnqueueNDRangeKernel(queue, kernel, dim, NULL, g_dims, NULL, 0, NULL, NULL);
+  if (DEBUG) warning("got here 6");
   
   // Execute
   clFlush(queue);
   clFinish(queue);
+  if (DEBUG) warning("got here 7");
   
   // Read out our results
-  if (clEnqueueReadBuffer(queue, mem_out, CL_TRUE, 0, sizeof(float) * x.n_rows, beta_fl, 0, NULL, NULL) != CL_SUCCESS)
-    stop("failed to read output");
+  if (clEnqueueReadBuffer(queue, beta_io, CL_TRUE, 0, sizeof(float) * x_cols, beta_fl, 0, NULL, NULL) != CL_SUCCESS)
+    stop("failed to read out beta");
+  if (clEnqueueReadBuffer(queue, eystar_io, CL_TRUE, 0, sizeof(float) * x_rows, eystar_fl, 0, NULL, NULL) != CL_SUCCESS)
+    stop("failed to read out eystar");
+  if (clEnqueueReadBuffer(queue, beta_temp_io, CL_TRUE, 0, sizeof(float) * x_cols * x_rows, beta_temp_fl, 0, NULL, NULL) != CL_SUCCESS)
+    stop("failed to read out eystar");
+  if (clEnqueueReadBuffer(queue, beta_part_io, CL_TRUE, 0, sizeof(float) * x_cols * x_rows, beta_part_fl, 0, NULL, NULL) != CL_SUCCESS)
+        stop("failed to read out eystar");
   
+  if (DEBUG) warning("got here 8");
+    
   // Extract results
-  for (int i = 0; i < x.n_cols; i++)
-    beta[i] = beta_fl[i];
-  //for (int i = 0; i < x.n_rows; i++)
-  //  eystar[i] = eystar_fl[i];
+  for (int i = 0; i < x_cols; i++)
+    (*beta)(i, 0) = beta_fl[i];
+  for (int i = 0; i < x_rows; i++)
+    (*eystar)(i, 0) = eystar_fl[i];
+
+  for (int i = 0; i < x_rows / 10; i++) {
+    for (int j = 0; j < x_cols; j++) {
+      Rcout << beta_part_fl[(j * x_rows) + i] << " ";
+      (*x)(i,j) = (double)beta_part_fl[(j * x_rows) + i];
+    }
+    Rcout << std::endl;
+  } 
   
-  // Release memory
-  delete [] y_fl;
-  delete [] x_fl;
-  delete [] beta_fl;
-  delete [] eystar_fl;
+  if (DEBUG) warning("got here 9");
   
   // Clean up OpenCL resources
-  clReleaseMemObject(mem_y_in);
-  clReleaseMemObject(mem_x_in);
-  clReleaseMemObject(mem_out);
+  clReleaseMemObject(x_in);
+  clReleaseMemObject(y_in);
+  clReleaseMemObject(z_in);
+  clReleaseMemObject(beta_temp_io);
+  clReleaseMemObject(beta_part_io);
+  clReleaseMemObject(beta_io);
+  clReleaseMemObject(eystar_io);
+    
+  // Release memory
+  delete [] x_fl;
+  delete [] y_fl;
+  delete [] z_fl;
+  delete [] beta_fl;
+  delete [] beta_temp_fl;
+  delete [] beta_part_fl;
+  delete [] eystar_fl;
+ 
+  // Clean up OpenCL resources (the rest)
   clReleaseCommandQueue(queue);
+  release_kernel();
 } // end em_parallel
 
 // [[Rcpp::export]]
-List survivalEM(const arma::mat y, const arma::mat x, // input
+List survivalEM(const arma::mat y,  arma::mat x, // input
                 const int max_iter, bool async) {
-  // Get the dimension of the matrices
-  //const int y_cols = y.n_cols;
-  //const int y_rows = y.n_rows;
-  //const int x_cols = x.n_cols;
-  //const int x_rows = x.n_rows;
-  
   // Check if the vectors are the same size
   if (y.n_rows != x.n_rows)
     stop("matrices not the same length");
@@ -252,29 +340,24 @@ List survivalEM(const arma::mat y, const arma::mat x, // input
   arma::mat eystar(x.n_rows, 1);
   beta.fill(0.0); 
   eystar.fill(0.0); 
-
-  if (async) {
-    // Load the OpenCL stuff here so we 
-    // don't have to do it every iteration
-    load_kernel();
-  } // end if
-
-  // Iterations
-  for (int i = 0; i < max_iter; i++) {
-    arma::mat mu = x * beta;
-    
-    // implement algorithm
-    if (async)
-      em_parallel(y, x, mu, &beta, &eystar);
-    //else
-      em_sequential(y, x, mu, &beta, &eystar);
-      
-    // maximization step
-    beta = (x.t() * x).i() * x.t() * eystar;
-  } // end for
   
+  // Do some matrix stuff up front
+  arma::mat z = (x.t() * x).i() * x.t();
+  
+  // implement algorithm
   if (async)
-    release_kernel();
+    em_parallel(&x, y, z, max_iter, &beta, &eystar);
+  else
+    em_sequential(x, y, z, max_iter, &beta, &eystar);
+  
+  // Output betas
+  if (DEBUG) {
+    for (int b = 0; b < x.n_cols; b++)
+      if (async)
+        Rcout << "par - beta " << b << ": " << beta(b, 0) << std::endl;
+      else
+        Rcout << "seq - beta " << b << ": " << beta(b, 0) << std::endl;
+  } // end if
   
   // Return list
   List out;
