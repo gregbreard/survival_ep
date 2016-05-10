@@ -1,3 +1,4 @@
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -19,9 +20,10 @@
 using namespace Rcpp;
 
 const bool DEBUG = false;
+const int GROUPS = 4;
 
 // Store the kernel source code in an array of lines
-const int SOURCE_LINES = 53;
+const int SOURCE_LINES = 52;
 const char* source[SOURCE_LINES] = {
   "#define M_SQRT1_2PI_F 0.3989422804\n",
   "// probability functions\n",
@@ -39,7 +41,7 @@ const char* source[SOURCE_LINES] = {
   "}\n",
   "// kernel for performing the expectation maximization \n",
   "kernel void batchEM(global float* x, global float* y, global float* z,\n",
-  "                    global float* b_temp, global float* beta_part, global float* beta, global float* eystar,\n",
+  "                    global float* beta_temp, global float* beta_part, global float* beta, global float* eystar,\n",
   "                    const int x_cols, const int x_rows, const int max_iter) {\n",
   "  // initialize our variables \n;",
   "  const size_t row = get_global_id(0);\n",
@@ -51,16 +53,16 @@ const char* source[SOURCE_LINES] = {
   "    float mu = 0.0;\n",
   "    // update mu \n",
   "    for (int l = 0; l < x_cols; l++)\n",
-  "      mu += x[(row * x_cols) + l] * beta[l];\n",
+  "      mu += x[(row * x_cols) + l] * beta_part[(grp * x_cols) + l];\n",
   "    // update our y star estimate \n",
   "    if (y[row] == 1.0)\n",
-  "      eystar[row] =  loc; // mu + f(mu);\n",
+  "      eystar[row] = mu + f(mu);\n",
   "    else if (y[row] == 0.0)\n",
-  "      eystar[row] = loc; // mu - g(mu);\n",
+  "      eystar[row] = mu - g(mu);\n",
+  "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
   "    // update our partial betas\n",
   "    for (int m = 0; m < x_cols; m++)\n",
-  "      b_temp[(m * x_rows) + row] = z[(m * x_rows) + row] * eystar[row];\n",
-  "    // wait for all the threads\n",
+  "      beta_temp[(m * x_rows) + row] = z[(m * x_rows) + row] * eystar[row];\n",
   "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
   "    if (loc < x_cols) { //if (row < x_cols) {\n",
   "      float beta_t = 0.0;\n",
@@ -68,13 +70,12 @@ const char* source[SOURCE_LINES] = {
   "      int start = grp * len;\n",
   "      int end = start + len;\n",
   "      for (int n = start; n < end; n++)\n",
-  "        beta_t += b_temp[(loc * x_rows) + n];\n", // "        beta_t += z_temp[(row * x_rows) + n];\n",
-  "      beta_part[(loc * x_rows) + grp] = beta_t; // beta[col] + beta_t;\n",
+  "        beta_t += beta_temp[(loc * x_rows) + n];\n", // "        beta_t += z_temp[(row * x_rows) + n];\n",
+  "      beta_part[(grp * x_cols) + loc] = beta_t; // beta[col] + beta_t;\n",
+  "      beta_part[(grps * x_cols) + loc] = NAN;\n",
   "    }\n",
   "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
   "  }\n",
-  "  //for (int b = 0; b < x_cols; b++)\n",
-  "    //beta[b] = 0;//my_beta[b];\n",
   "}\n"
 };
 
@@ -201,7 +202,7 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   float *y_fl = new float[x_rows];
   float *z_fl = new float[x_cols * x_rows];
   float *beta_temp_fl = new float[x_cols * x_rows];
-  float *beta_part_fl = new float[x_cols * x_rows];
+  float *beta_part_fl = new float[x_rows * x_cols];
   float *beta_fl = new float[x_cols];
   float *eystar_fl = new float[x_rows];
   
@@ -240,7 +241,7 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   
   // Set the input/output memory
   cl_mem beta_temp_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows), beta_temp_fl, &err);
-  cl_mem beta_part_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows), beta_part_fl, &err);
+  cl_mem beta_part_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_rows * x_cols), beta_part_fl, &err);
   cl_mem beta_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_cols, beta_fl, &err);
   cl_mem eystar_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_rows, eystar_fl, &err);
   if (err != CL_SUCCESS)
@@ -269,7 +270,8 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   // Set the kernel for execution
   const int dim = 1;
   const size_t g_dims[] = {x_rows};
-  clEnqueueNDRangeKernel(queue, kernel, dim, NULL, g_dims, NULL, 0, NULL, NULL);
+  const size_t l_dims[] = {x_rows / GROUPS};
+  clEnqueueNDRangeKernel(queue, kernel, dim, NULL, g_dims, l_dims, 0, NULL, NULL);
   if (DEBUG) warning("got here 6");
   
   // Execute
@@ -284,7 +286,7 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
     stop("failed to read out eystar");
   if (clEnqueueReadBuffer(queue, beta_temp_io, CL_TRUE, 0, sizeof(float) * x_cols * x_rows, beta_temp_fl, 0, NULL, NULL) != CL_SUCCESS)
     stop("failed to read out eystar");
-  if (clEnqueueReadBuffer(queue, beta_part_io, CL_TRUE, 0, sizeof(float) * x_cols * x_rows, beta_part_fl, 0, NULL, NULL) != CL_SUCCESS)
+  if (clEnqueueReadBuffer(queue, beta_part_io, CL_TRUE, 0, sizeof(float) * x_rows * x_cols, beta_part_fl, 0, NULL, NULL) != CL_SUCCESS)
         stop("failed to read out eystar");
   
   if (DEBUG) warning("got here 8");
@@ -295,10 +297,12 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   for (int i = 0; i < x_rows; i++)
     (*eystar)(i, 0) = eystar_fl[i];
 
-  for (int i = 0; i < x_rows / 10; i++) {
+  for (int i = 0; i < x_rows / 50; i++) {
+    if (isnan((double)beta_part_fl[(i * x_cols)]))
+      break;
     for (int j = 0; j < x_cols; j++) {
-      Rcout << beta_part_fl[(j * x_rows) + i] << " ";
-      (*x)(i,j) = (double)beta_part_fl[(j * x_rows) + i];
+      Rcout << beta_part_fl[(i * x_cols) + j] << " ";
+      (*beta)(j,0) += (double)beta_part_fl[(i * x_cols) + j];
     }
     Rcout << std::endl;
   } 
