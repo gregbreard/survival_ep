@@ -20,10 +20,12 @@
 using namespace Rcpp;
 
 const bool DEBUG = false;
-const int GROUPS = 4;
+
+// The log2(rows) in the partial beta array to run the sequential sum on
+const int CUTOFF = 8;
 
 // Store the kernel source code in an array of lines
-const int SOURCE_LINES = 52;
+const int SOURCE_LINES = 50;
 const char* source[SOURCE_LINES] = {
   "#define M_SQRT1_2PI_F 0.3989422804\n",
   "// probability functions\n",
@@ -40,42 +42,43 @@ const char* source[SOURCE_LINES] = {
   "  return (dnorm(-mu) / pnorm(-mu));\n",
   "}\n",
   "// kernel for performing the expectation maximization \n",
-  "kernel void batchEM(global float* x, global float* y, global float* z,\n",
-  "                    global float* beta_temp, global float* beta_part, global float* beta, global float* eystar,\n",
-  "                    const int x_cols, const int x_rows, const int max_iter) {\n",
-  "  // initialize our variables \n;",
+  "kernel void expectation(global float* x, global float* y,\n",
+  "                        global float* beta, global float* eystar,\n",
+  "                        const int x_cols, const int x_rows) {\n",
   "  const size_t row = get_global_id(0);\n",
-  "  const size_t loc = get_local_id(0);\n",
-  "  const size_t grp = get_group_id(0);\n",
-  "  const size_t grps = get_num_groups(0);\n",
-  "  // run our iterations \n",
-  "  for (int k = 0; k < max_iter; k++) {\n",
-  "    float mu = 0.0;\n",
-  "    // update mu \n",
-  "    for (int l = 0; l < x_cols; l++)\n",
-  "      mu += x[(row * x_cols) + l] * beta_part[(grp * x_cols) + l];\n",
-  "    // update our y star estimate \n",
-  "    if (y[row] == 1.0)\n",
-  "      eystar[row] = mu + f(mu);\n",
-  "    else if (y[row] == 0.0)\n",
-  "      eystar[row] = mu - g(mu);\n",
-  "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
-  "    // update our partial betas\n",
-  "    for (int m = 0; m < x_cols; m++)\n",
-  "      beta_temp[(m * x_rows) + row] = z[(m * x_rows) + row] * eystar[row];\n",
-  "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
-  "    if (loc < x_cols) { //if (row < x_cols) {\n",
-  "      float beta_t = 0.0;\n",
-  "      int len = x_rows / grps;\n",
-  "      int start = grp * len;\n",
-  "      int end = start + len;\n",
-  "      for (int n = start; n < end; n++)\n",
-  "        beta_t += beta_temp[(loc * x_rows) + n];\n", // "        beta_t += z_temp[(row * x_rows) + n];\n",
-  "      beta_part[(grp * x_cols) + loc] = beta_t; // beta[col] + beta_t;\n",
-  "      beta_part[(grps * x_cols) + loc] = NAN;\n",
-  "    }\n",
-  "    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);\n",
-  "  }\n",
+  "  float mu = 0.0;\n",
+  "  for (int l = 0; l < x_cols; l++)\n",
+  "    mu += x[(row * x_cols) + l] * beta[l];\n",
+  "  if (y[row] == 1.0)\n",
+  "    eystar[row] = mu + f(mu);\n",
+  "  else if (y[row] == 0.0)\n",
+  "    eystar[row] = mu - g(mu);\n",
+  "}\n"
+  "// kernel for performing multiplication of each z(i,j) and y*(i) \n",
+  "kernel void beta_part(global float* z, global float* eystar,\n",
+  "                      global float* beta_part,\n",
+  "                      const int x_rows) {\n",
+  "  const size_t row = get_global_id(0);\n",
+  "  const size_t col = get_global_id(1);\n",
+  "  beta_part[(col * x_rows) + row] = z[(col * x_rows) + row] * eystar[row];\n",
+  "}\n"
+  "// kernel for performing addition of each beta(i,j)\n",
+  "kernel void part_sum(global float* beta_part, const int x_rows) {\n",
+  "  const size_t row = get_global_id(0);\n",
+  "  const size_t col = get_global_id(1);\n",
+  "  const size_t n = get_global_size(0);\n",
+  "  const size_t add_row = row + n;\n",
+  "  if (add_row < x_rows)\n",
+  "    beta_part[(col * x_rows) + row] = beta_part[(col * x_rows) + row] + beta_part[(col * x_rows) + add_row];\n",
+  "}\n"
+  "// kernel for performing addition of each beta(i,j)\n",
+  "kernel void beta_sum(global float* beta_part, global float* beta,\n",
+  "                     const int x_rows, const int min_rows) {\n",
+  "  const size_t col = get_global_id(0);\n",
+  "  float sum = 0.0;\n",
+  "  for (int i = 0; i < min_rows; i++)\n",
+  "    sum += beta_part[(col * x_rows) + i];\n",
+  "  beta[col] = sum;\n",
   "}\n"
 };
 
@@ -87,7 +90,10 @@ cl_uint deviceCount;
 cl_device_id device;
 cl_context context;
 cl_program program;
-cl_kernel kernel;
+cl_kernel exp_kernel;
+cl_kernel beta_part_kernel;
+cl_kernel part_sum_kernel;
+cl_kernel beta_sum_kernel;
 cl_command_queue queue;
 bool kernel_loaded = false;
 
@@ -143,11 +149,32 @@ void load_kernel() {
       stop("program could not be built");
     }
     
-    // Create the kernel
-    kernel = clCreateKernel(program, "batchEM", &err);
+    // Create the expectation kernel
+    exp_kernel = clCreateKernel(program, "expectation", &err);
     if (err != CL_SUCCESS) {
       fprintf(stdout, "code: %d\n", err);
-      stop("kernel could not be created");
+      stop("expectation kernel could not be created");
+    }
+    
+    // Create the beta part kernel
+    beta_part_kernel = clCreateKernel(program, "beta_part", &err);
+    if (err != CL_SUCCESS) {
+      fprintf(stdout, "code: %d\n", err);
+      stop("beta part kernel could not be created");
+    }
+    
+    // Create the beta part kernel
+    part_sum_kernel = clCreateKernel(program, "part_sum", &err);
+    if (err != CL_SUCCESS) {
+      fprintf(stdout, "code: %d\n", err);
+      stop("part sum kernel could not be created");
+    }
+    
+    // Create the beta part kernel
+    beta_sum_kernel = clCreateKernel(program, "beta_sum", &err);
+    if (err != CL_SUCCESS) {
+      fprintf(stdout, "code: %d\n", err);
+      stop("beta sum kernel could not be created");
     }
     
     // Don't need to reload
@@ -157,7 +184,10 @@ void load_kernel() {
 
 // Releases the devices, etc used by Open CL
 void release_kernel() {
-  clReleaseKernel(kernel);
+  clReleaseKernel(exp_kernel);
+  clReleaseKernel(beta_part_kernel);
+  clReleaseKernel(part_sum_kernel);
+  clReleaseKernel(beta_sum_kernel);
   clReleaseProgram(program);
   clReleaseContext(context);
   
@@ -201,8 +231,7 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   float *x_fl = new float[x_rows * x_cols];
   float *y_fl = new float[x_rows];
   float *z_fl = new float[x_cols * x_rows];
-  float *beta_temp_fl = new float[x_cols * x_rows];
-  float *beta_part_fl = new float[x_rows * x_cols];
+  float *beta_part_fl = new float[x_cols * x_rows];
   float *beta_fl = new float[x_cols];
   float *eystar_fl = new float[x_rows];
   
@@ -213,7 +242,6 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
     for (int j = 0; j < x_cols; j++) {
       x_fl[(i * x_cols) + j] = (float)(*x)(i, j);
       z_fl[(j * x_rows) + i] = (float)z(j, i);
-      beta_temp_fl[(j * x_rows) + i] = 0.0;
       beta_part_fl[(j * x_rows) + i] = 0.0;
       
       if (i == 0)
@@ -240,8 +268,7 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   if (DEBUG) warning("got here 3");
   
   // Set the input/output memory
-  cl_mem beta_temp_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows), beta_temp_fl, &err);
-  cl_mem beta_part_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_rows * x_cols), beta_part_fl, &err);
+  cl_mem beta_part_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * (x_cols * x_rows), beta_part_fl, &err);
   cl_mem beta_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_cols, beta_fl, &err);
   cl_mem eystar_io = clCreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(float) * x_rows, eystar_fl, &err);
   if (err != CL_SUCCESS)
@@ -249,29 +276,65 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   if (DEBUG) warning("got here 3.5");
     
   // Set scalar memory
-  const cl_int max_iter_in = max_iter;
   const cl_int x_cols_in = x_cols;
   const cl_int x_rows_in = x_rows;
+  const cl_int min_rows_in = (int)pow(2, CUTOFF);
   
   // Set the parameters
-  clSetKernelArg(kernel, 0, sizeof(cl_mem), &x_in);
-  clSetKernelArg(kernel, 1, sizeof(cl_mem), &y_in);
-  clSetKernelArg(kernel, 2, sizeof(cl_mem), &z_in);
-  clSetKernelArg(kernel, 3, sizeof(cl_mem), &beta_temp_io);
-  clSetKernelArg(kernel, 4, sizeof(cl_mem), &beta_part_io);
-  clSetKernelArg(kernel, 5, sizeof(cl_mem), &beta_io);
-  clSetKernelArg(kernel, 6, sizeof(cl_mem), &eystar_io);
-  clSetKernelArg(kernel, 7, sizeof(cl_int), &x_cols_in);
-  clSetKernelArg(kernel, 8, sizeof(cl_int), &x_rows_in);
-  clSetKernelArg(kernel, 9, sizeof(cl_int), &max_iter_in);
+  // -- expectation
+  clSetKernelArg(exp_kernel, 0, sizeof(cl_mem), &x_in);
+  clSetKernelArg(exp_kernel, 1, sizeof(cl_mem), &y_in);
+  clSetKernelArg(exp_kernel, 2, sizeof(cl_mem), &beta_io);
+  clSetKernelArg(exp_kernel, 3, sizeof(cl_mem), &eystar_io);
+  clSetKernelArg(exp_kernel, 4, sizeof(cl_int), &x_cols_in);
+  clSetKernelArg(exp_kernel, 5, sizeof(cl_int), &x_rows_in);
+  // -- beta part
+  clSetKernelArg(beta_part_kernel, 0, sizeof(cl_mem), &z_in);
+  clSetKernelArg(beta_part_kernel, 1, sizeof(cl_mem), &eystar_io);
+  clSetKernelArg(beta_part_kernel, 2, sizeof(cl_mem), &beta_part_io);
+  clSetKernelArg(beta_part_kernel, 3, sizeof(cl_int), &x_rows_in);
+  // -- sum part
+  clSetKernelArg(part_sum_kernel, 0, sizeof(cl_mem), &beta_part_io);
+  clSetKernelArg(part_sum_kernel, 1, sizeof(cl_int), &x_rows_in);
+  // -- beta sum
+  clSetKernelArg(beta_sum_kernel, 0, sizeof(cl_mem), &beta_part_io);
+  clSetKernelArg(beta_sum_kernel, 1, sizeof(cl_mem), &beta_io);
+  clSetKernelArg(beta_sum_kernel, 2, sizeof(cl_int), &x_rows_in);
+  clSetKernelArg(beta_sum_kernel, 3, sizeof(cl_int), &min_rows_in);
   
   if (DEBUG) warning("got here 5");
   
-  // Set the kernel for execution
-  const int dim = 1;
-  const size_t g_dims[] = {x_rows};
-  const size_t l_dims[] = {x_rows / GROUPS};
-  clEnqueueNDRangeKernel(queue, kernel, dim, NULL, g_dims, l_dims, 0, NULL, NULL);
+  // Initialize
+  const int log_rows = (int)ceilf(log2f(x_rows));
+  const int part_sums = log_rows - (CUTOFF - 1);
+  const int exp_dim = 1;
+  const int beta_part_dim = 2;
+  const int part_sum_dim = 2;
+  const int beta_sum_dim = 1;
+  const size_t exp_dims[] = {x_rows};
+  const size_t beta_part_dims[] = {x_rows, x_cols};
+  const size_t beta_sum_dims[] = {x_cols};
+  
+  if (DEBUG) warning("got here 5.5");
+  
+  // Queue up the kernels for execution
+  for (int i = 0; i < max_iter; i++) { 
+    // expectation
+    clEnqueueNDRangeKernel(queue, exp_kernel, exp_dim, NULL, exp_dims, NULL, 0, NULL, NULL);
+    
+    // beta = z * y*
+    clEnqueueNDRangeKernel(queue, beta_part_kernel, beta_part_dim, NULL, beta_part_dims, NULL, 0, NULL, NULL);
+    
+    // partial sums
+    for (int s = 1; s < part_sums; s++) {
+      const int rows = (int)pow(2, log_rows - s);
+      const size_t part_sum_dims[] = {rows, x_cols};
+      clEnqueueNDRangeKernel(queue, part_sum_kernel, part_sum_dim, NULL, part_sum_dims, NULL, 0, NULL, NULL);
+    } // end for
+    
+    // full sums
+    clEnqueueNDRangeKernel(queue, beta_sum_kernel, beta_sum_dim, NULL, beta_sum_dims, NULL, 0, NULL, NULL);
+  }// end for
   if (DEBUG) warning("got here 6");
   
   // Execute
@@ -284,10 +347,8 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
     stop("failed to read out beta");
   if (clEnqueueReadBuffer(queue, eystar_io, CL_TRUE, 0, sizeof(float) * x_rows, eystar_fl, 0, NULL, NULL) != CL_SUCCESS)
     stop("failed to read out eystar");
-  if (clEnqueueReadBuffer(queue, beta_temp_io, CL_TRUE, 0, sizeof(float) * x_cols * x_rows, beta_temp_fl, 0, NULL, NULL) != CL_SUCCESS)
-    stop("failed to read out eystar");
-  if (clEnqueueReadBuffer(queue, beta_part_io, CL_TRUE, 0, sizeof(float) * x_rows * x_cols, beta_part_fl, 0, NULL, NULL) != CL_SUCCESS)
-        stop("failed to read out eystar");
+  if (clEnqueueReadBuffer(queue, beta_part_io, CL_TRUE, 0, sizeof(float) * x_cols * x_rows, beta_part_fl, 0, NULL, NULL) != CL_SUCCESS)
+    stop("failed to read out beta_part");
   
   if (DEBUG) warning("got here 8");
     
@@ -297,14 +358,12 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   for (int i = 0; i < x_rows; i++)
     (*eystar)(i, 0) = eystar_fl[i];
 
-  for (int i = 0; i < x_rows / 50; i++) {
-    if (isnan((double)beta_part_fl[(i * x_cols)]))
-      break;
+  for (int i = 0; i < x_rows; i++) {
     for (int j = 0; j < x_cols; j++) {
-      Rcout << beta_part_fl[(i * x_cols) + j] << " ";
-      (*beta)(j,0) += (double)beta_part_fl[(i * x_cols) + j];
+      if (DEBUG) Rcout << beta_part_fl[(j * x_rows) + i] << " ";
+      (*x)(i,j) = (double)beta_part_fl[(j * x_rows) + i];
     }
-    Rcout << std::endl;
+    if (DEBUG) Rcout << std::endl;
   } 
   
   if (DEBUG) warning("got here 9");
@@ -313,7 +372,6 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   clReleaseMemObject(x_in);
   clReleaseMemObject(y_in);
   clReleaseMemObject(z_in);
-  clReleaseMemObject(beta_temp_io);
   clReleaseMemObject(beta_part_io);
   clReleaseMemObject(beta_io);
   clReleaseMemObject(eystar_io);
@@ -323,7 +381,6 @@ void em_parallel(arma::mat* x,  arma::mat y,  arma::mat z,  int max_iter,
   delete [] y_fl;
   delete [] z_fl;
   delete [] beta_fl;
-  delete [] beta_temp_fl;
   delete [] beta_part_fl;
   delete [] eystar_fl;
  
